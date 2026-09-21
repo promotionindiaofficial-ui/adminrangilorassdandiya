@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rangilo Rass Dandiya | Admin Verification</title>
+  <script src="https://unpkg.com/html5-qrcode" defer></script>
   <style>
     :root { font-family: Arial, sans-serif; color: #321722; background: #210812; }
     * { box-sizing: border-box; }
@@ -22,6 +23,10 @@
     .result.visible { display: block; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; }
     .status { min-height: 1.5em; margin-top: 15px; font-weight: 700; }
+    .scanner { margin-top: 18px; padding: 14px; background: #fff0c7; border: 1px solid #e6b84f; border-radius: 10px; }
+    #reader { display: none; max-width: 420px; margin: 12px auto 0; overflow: hidden; background: #fff; border-radius: 8px; }
+    #reader.visible { display: block; }
+    .scan-result { min-height: 1.2em; margin-top: 8px; font-size: .88rem; }
     .success { color: #18733d; } .error { color: #ad2533; } .info { color: #5e4d40; }
     small { color: #80665a; }
     @media (max-width: 520px) { .actions, .grid { grid-template-columns: 1fr; } }
@@ -32,20 +37,13 @@
     <h1>Rangilo Rass Dandiya</h1>
     <p><strong>Admin Payment Verification</strong><br />Look up a ticket, compare the UTR with your payment record, then mark it verified or rejected.</p>
 
-    <label for="backendUrl">Apps Script Web App /exec URL</label>
-    <input id="backendUrl" type="url" placeholder="https://script.google.com/macros/s/.../exec" autocomplete="url" />
-
-    <label for="adminToken">Admin Token</label>
-    <input id="adminToken" type="password" placeholder="Enter your private ADMIN_TOKEN" autocomplete="current-password" />
-    <small>The token is kept only in this browser tab and is never saved to the page.</small>
-
-    <label for="ticketId">Ticket ID</label>
-    <input id="ticketId" type="text" placeholder="RRD-XXXXXXXX" autocomplete="off" />
-
-    <div class="actions">
-      <button id="lookupBtn" type="button">Lookup Ticket</button>
-      <button id="clearBtn" class="secondary" type="button">Clear</button>
-    </div>
+    <section class="scanner">
+      <strong>Scan Pass QR</strong>
+      <p>Use the device camera to scan the QR printed on the participant's pass. The ticket ID will be filled automatically.</p>
+      <button id="scanBtn" class="secondary" type="button">Start Camera Scanner</button>
+      <div id="reader"></div>
+      <div id="scanResult" class="scan-result" role="status" aria-live="polite"></div>
+    </section>
 
     <section id="result" class="result" aria-live="polite">
       <div class="grid">
@@ -58,16 +56,9 @@
         <div><strong>Current Status</strong><br /><span id="rStatus">—</span></div>
         <div><strong>Created</strong><br /><span id="rCreated">—</span></div>
       </div>
-      <label for="newStatus">Change Payment Status</label>
-      <select id="newStatus">
-        <option value="VERIFIED">VERIFIED</option>
-        <option value="REJECTED">REJECTED</option>
-        <option value="PENDING_VERIFICATION">PENDING_VERIFICATION</option>
-        <option value="REFUNDED">REFUNDED</option>
-      </select>
       <label for="notes">Verification Notes</label>
       <input id="notes" type="text" maxlength="500" placeholder="Example: UTR matched in bank statement" />
-      <button id="updateBtn" type="button">Update Payment Status</button>
+      <button id="updateBtn" type="button">Verify Scanned Pass</button>
     </section>
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </main>
@@ -75,24 +66,48 @@
   <script>
     'use strict';
     const $ = id => document.getElementById(id);
+    // One-time configuration: replace these values before publishing the admin page.
+    // The admin user will not need to enter them on every scan.
+    const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbxCBEljx-NTOqjJHBKoZxy7OgsYuXR-H5F1dRgTdoi0YsmkEIPzR5_cEMQDEAu3O_ma/exec';
+    const ADMIN_TOKEN = '6d28aa34c9be40e8841c99061aa327275372a014e6f643f482be380cb80678b7';
     let currentTicket = null;
+    let qrScanner = null;
+    let scannerRunning = false;
     function setStatus(message, type = 'info') { $('status').textContent = message; $('status').className = `status ${type}`; }
     function config() {
-      const url = $('backendUrl').value.trim();
-      const token = $('adminToken').value;
-      const ticketId = $('ticketId').value.trim();
-      if (!url || !url.endsWith('/exec')) throw new Error('Enter the deployed Apps Script /exec URL.');
-      if (!token) throw new Error('Enter the admin token.');
-      if (!ticketId) throw new Error('Enter a ticket ID.');
-      return { url, token, ticketId };
+      if (BACKEND_URL.includes('PASTE_YOUR_') || !BACKEND_URL.endsWith('/exec')) throw new Error('Admin backend URL is not configured in the code.');
+      if (ADMIN_TOKEN.includes('PASTE_YOUR_') || !ADMIN_TOKEN.trim()) throw new Error('Admin token is not configured in the code.');
+      return { url: BACKEND_URL, token: ADMIN_TOKEN.trim() };
     }
     async function callBackend(payload) {
-      const response = await fetch($('backendUrl').value.trim(), {
+      const response = await fetch(BACKEND_URL, {
         method: 'POST', mode: 'cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload)
       });
       const result = await response.json();
       if (!result.ok) throw new Error(result.error || 'Backend request failed.');
       return result;
+    }
+    function parseTicketQr(text) {
+      const parts = String(text || '').trim().split('|');
+      if (parts.length >= 3 && parts[0] === 'RRD' && parts[1]) return { ticketId: parts[1], utr: parts.slice(2).join('|') };
+      throw new Error('This QR is not a Rangilo Rass Dandiya ticket QR.');
+    }
+    async function stopScanner() {
+      if (qrScanner && scannerRunning) { await qrScanner.stop(); await qrScanner.clear(); }
+      scannerRunning = false; $('reader').classList.remove('visible'); $('scanBtn').textContent = 'Start Camera Scanner';
+    }
+    async function startScanner() {
+      if (typeof Html5Qrcode !== 'function') throw new Error('Camera scanner library is still loading. Reload the page and try again.');
+      $('reader').classList.add('visible'); $('scanBtn').textContent = 'Stop Camera Scanner';
+      qrScanner = new Html5Qrcode('reader'); scannerRunning = true;
+      await qrScanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 250, height: 250 } }, async decodedText => {
+        try {
+          const scanned = parseTicketQr(decodedText);
+          $('scanResult').textContent = `Scanned ${scanned.ticketId}. Looking up ticket…`;
+          await stopScanner();
+          await lookupScannedTicket(scanned.ticketId);
+        } catch (error) { $('scanResult').textContent = error.message; }
+      }, () => {});
     }
     function showTicket(record) {
       currentTicket = record;
@@ -101,18 +116,25 @@
         rTotal: 'Total Amount', rUtr: 'UTR / Reference', rStatus: 'Payment Status', rCreated: 'Created At'
       };
       Object.entries(map).forEach(([id, key]) => { $(id).textContent = record[key] ?? '—'; });
-      $('newStatus').value = record['Payment Status'] || 'PENDING_VERIFICATION';
       $('result').classList.add('visible');
     }
-    $('lookupBtn').addEventListener('click', async () => {
-      try { const c = config(); setStatus('Looking up ticket…'); $('lookupBtn').disabled = true; showTicket((await callBackend({ action: 'lookup', adminToken: c.token, ticketId: c.ticketId })).registration); setStatus('Ticket loaded. Verify the UTR before updating.', 'success'); }
-      catch (e) { setStatus(e.message, 'error'); } finally { $('lookupBtn').disabled = false; }
-    });
+    async function lookupScannedTicket(ticketId) {
+      const c = config();
+      if (!ticketId) throw new Error('No ticket ID was found in the QR code.');
+      setStatus('Loading scanned ticket…');
+      showTicket((await callBackend({ action: 'lookup', adminToken: c.token, ticketId: ticketId })).registration);
+      setStatus('Ticket loaded from QR scan. Review the UTR and click Verify Scanned Pass.', 'success');
+    }
     $('updateBtn').addEventListener('click', async () => {
-      try { const c = config(); if (!currentTicket) throw new Error('Look up a ticket first.'); $('updateBtn').disabled = true; setStatus('Updating payment status…'); await callBackend({ action: 'verify', adminToken: c.token, ticketId: c.ticketId, paymentStatus: $('newStatus').value, notes: $('notes').value.trim() }); setStatus('Payment status updated successfully.', 'success'); const refreshed = await callBackend({ action: 'lookup', adminToken: c.token, ticketId: c.ticketId }); showTicket(refreshed.registration); }
+      try { const c = config(); if (!currentTicket) throw new Error('Scan a ticket QR code first.'); $('updateBtn').disabled = true; setStatus('Verifying scanned pass…'); await callBackend({ action: 'verify', adminToken: c.token, ticketId: currentTicket['Ticket ID'], paymentStatus: 'VERIFIED', notes: $('notes').value.trim() || 'Verified by QR scan' }); setStatus('Pass verified successfully.', 'success'); const refreshed = await callBackend({ action: 'lookup', adminToken: c.token, ticketId: currentTicket['Ticket ID'] }); showTicket(refreshed.registration); }
       catch (e) { setStatus(e.message, 'error'); } finally { $('updateBtn').disabled = false; }
     });
-    $('clearBtn').addEventListener('click', () => { currentTicket = null; $('result').classList.remove('visible'); $('status').textContent = ''; $('ticketId').value = ''; $('notes').value = ''; });
+    $('scanBtn').addEventListener('click', async () => {
+      try {
+        if (scannerRunning) await stopScanner();
+        else await startScanner();
+      } catch (error) { $('scanResult').textContent = error.message || 'Unable to access the camera.'; await stopScanner(); }
+    });
   </script>
 </body>
 </html>
